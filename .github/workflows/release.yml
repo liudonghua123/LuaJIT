@@ -1,0 +1,116 @@
+name: Cross-platform Build and Release
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+  actions: write
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      # Windows builds use MSVC (Visual Studio) via the provided batch script.
+
+      - name: Install build dependencies (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          if [ "${{ matrix.os }}" = "macos-latest" ]; then
+            brew update || true
+            brew install make || true
+          else
+            sudo apt-get update || true
+            sudo apt-get install -y build-essential || true
+          fi
+        shell: bash
+
+      - name: Build LuaJIT (Windows - MSVC)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-Not (Test-Path $vswhere)) {
+            Write-Error "vswhere not found at $vswhere"
+            exit 1
+          }
+          $inst = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-Not $inst) { Write-Error 'No suitable Visual Studio installation found'; exit 1 }
+          $vcvars = Join-Path $inst 'VC\Auxiliary\Build\vcvarsall.bat'
+          if (-Not (Test-Path $vcvars)) { Write-Error "vcvarsall.bat not found at $vcvars"; exit 1 }
+          Write-Host "Using VC vars: $vcvars"
+          cmd /c "`"$vcvars`" x64 && cd src && call msvcbuild.bat"
+
+      - name: Build LuaJIT (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -e
+          make clean || true
+          if [ "$(uname)" = "Darwin" ]; then
+            export MACOSX_DEPLOYMENT_TARGET=11.0
+          fi
+          if command -v nproc >/dev/null 2>&1; then
+            CORES=$(nproc)
+          elif command -v sysctl >/dev/null 2>&1; then
+            CORES=$(sysctl -n hw.ncpu)
+          else
+            CORES=2
+          fi
+          make -j"${CORES}"
+
+      - name: Package artifacts (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $bin = Get-ChildItem -Path src -Recurse -Filter luajit.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $bin) { Write-Error 'No luajit.exe found under src'; exit 1 }
+          $dll = Get-ChildItem -Path src -Recurse -Filter lua51.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+          $files = @($bin.FullName)
+          if ($dll) { $files += $dll.FullName }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $zipPath = Join-Path (Get-Location) 'dist\luajit-windows-latest.zip'
+          if (Test-Path $zipPath) { Remove-Item $zipPath }
+          Compress-Archive -Path $files -DestinationPath $zipPath -Force
+          Write-Host "Packaged: $zipPath"
+
+      - name: Package artifacts (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          BIN=src/luajit
+          if [ ! -f "$BIN" ]; then
+            BIN=$(find src -type f -iname 'luajit' -print -quit || true)
+          fi
+          if [ -z "$BIN" ]; then
+            echo "No binary found in src/" && find src -maxdepth 3 -type f -print || true
+            exit 1
+          fi
+          LIBS=$(find src -maxdepth 1 \( -name 'libluajit.so' -o -name 'libluajit.so.*' -o -name 'libluajit.a' -o -name 'libluajit.dylib' \) -print 2>/dev/null || true)
+          tar -czf "dist/luajit-${{ matrix.os }}.tar.gz" -C src $(basename "$BIN") $(for lib in $LIBS; do basename "$lib"; done)
+
+      - name: Release to GitHub Releases (latest)
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/**
+          tag_name: latest
+          name: latest
+          body: Built by CI run ${{ github.run_id }} on ${{ matrix.os }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
